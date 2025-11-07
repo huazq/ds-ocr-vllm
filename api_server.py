@@ -181,7 +181,7 @@ def _clean_text_and_collect_regions(
     # Produce a markdown-friendly text: replace image refs, drop others
     cleaned = text
     for idx, m in enumerate(image_matches):
-        cleaned = cleaned.replace(m, "\n")
+        cleaned = cleaned.replace(m, f"![](image_{page_index}_{idx}.jpg)\n")
     for m in other_matches:
         cleaned = (
             cleaned.replace(m, "")
@@ -191,7 +191,7 @@ def _clean_text_and_collect_regions(
             .replace("\\\\eqqcolon", "=:")
         )
 
-    return {"text": cleaned}
+    return {"text_raw": text, "text_markdown": cleaned, "regions": regions}
 
 def _build_mm_request(image: Image.Image, prompt: str) -> Dict[str, Any]:
     image_features = DeepseekOCRProcessor().tokenize_with_images(
