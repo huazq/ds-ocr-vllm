@@ -1,0 +1,5 @@
+PyMuPDF
+easydict
+addict
+Pillow
+tools
