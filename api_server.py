@@ -4,6 +4,9 @@ import re
 import ast
 from typing import List, Dict, Any, Optional
 
+import argparse
+import uvicorn
+
 import fitz  # PyMuPDF
 from PIL import Image, ImageOps
 
@@ -20,16 +23,25 @@ from process.image_process import DeepseekOCRProcessor
 from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
 
 PROMPT_PERFIX='<image>\n<|grounding|>'
-PROMPT = 'Convert the document to markdown.'
+DEFAULT_PROMPT = 'Convert the document to markdown.'
 CROP_MODE = True
+DEFAULT_MODEL_PATH="/mnt/models"
+DEFAULT_MODEL_NAME="DeepSeek-OCR"
 
 # Register custom model class with vLLM
 ModelRegistry.register_model("DeepseekOCRForCausalLM", DeepseekOCRForCausalLM)
 
 
-def _init_llm(model_path: str, max_concurrency: int) -> LLM:
+def _init_llm(model_name: str,
+              model_path: str,
+              max_concurrency: int,
+              tensor_parallel_size: int) -> LLM:
+    # model_path is parent dir of model,
+    # we need pass model_path+model_name to vllm
+    model = model_path + "/" + model_name
     llm_local = LLM(
-        model=model_path,
+        served_model_name=model_name,
+        model=model,
         hf_overrides={"architectures": ["DeepseekOCRForCausalLM"]},
         block_size=64,
         enforce_eager=False,
@@ -37,7 +49,7 @@ def _init_llm(model_path: str, max_concurrency: int) -> LLM:
         max_model_len=8192,
         swap_space=0,
         max_num_seqs=max_concurrency,
-        tensor_parallel_size=1,
+        tensor_parallel_size=tensor_parallel_size,
         gpu_memory_utilization=0.9,
         disable_mm_preprocessor_cache=True,
     )
@@ -46,55 +58,6 @@ def _init_llm(model_path: str, max_concurrency: int) -> LLM:
 
 # Global singleton LLM and its current settings
 llm: Optional[LLM] = None
-CURRENT_MODEL_PATH: Optional[str] = None
-CURRENT_MAX_CONCURRENCY: Optional[int] = None
-import threading
-_llm_lock = threading.Lock()
-
-
-def _ensure_llm(model_path: Optional[str], max_concurrency: Optional[int]) -> None:
-    """Ensure a global LLM exists with the requested settings.
-
-    If any of the parameters differ from the current ones, reinitialize.
-    Fallback to environment if not provided.
-    """
-    global llm, CURRENT_MODEL_PATH, CURRENT_MAX_CONCURRENCY
-
-    # Defaults from environment
-    env_model = os.environ.get("DS_MODEL_PATH")
-    env_conc = os.environ.get("DS_MAX_CONCURRENCY")
-
-    target_model = model_path or CURRENT_MODEL_PATH or env_model
-    if target_model is None:
-        raise RuntimeError("Model path not provided. Set DS_MODEL_PATH or pass model_path.")
-
-    if max_concurrency is None:
-        if CURRENT_MAX_CONCURRENCY is not None:
-            target_conc = CURRENT_MAX_CONCURRENCY
-        elif env_conc is not None:
-            try:
-                target_conc = int(env_conc)
-            except Exception:
-                raise RuntimeError("Invalid DS_MAX_CONCURRENCY; must be int")
-        else:
-            target_conc = 32  # sensible default
-    else:
-        target_conc = int(max_concurrency)
-    if target_conc < 1:
-        raise RuntimeError("max_concurrency must be >= 1")
-
-    with _llm_lock:
-        need_reinit = (
-            llm is None
-            or CURRENT_MODEL_PATH != target_model
-            or CURRENT_MAX_CONCURRENCY != target_conc
-        )
-        if need_reinit:
-            llm = _init_llm(target_model, target_conc)
-            CURRENT_MODEL_PATH = target_model
-            CURRENT_MAX_CONCURRENCY = target_conc
-
-
 sampling_params = SamplingParams(
     temperature=0.0,
     max_tokens=8192,
@@ -181,7 +144,7 @@ def _clean_text_and_collect_regions(
     # Produce a markdown-friendly text: replace image refs, drop others
     cleaned = text
     for idx, m in enumerate(image_matches):
-        cleaned = cleaned.replace(m, f"![](image_{page_index}_{idx}.jpg)\n")
+        cleaned = cleaned.replace(m, "\n")
     for m in other_matches:
         cleaned = (
             cleaned.replace(m, "")
@@ -191,7 +154,7 @@ def _clean_text_and_collect_regions(
             .replace("\\\\eqqcolon", "=:")
         )
 
-    return {"text_raw": text, "text_markdown": cleaned, "regions": regions}
+    return {"text": cleaned}
 
 def _build_mm_request(image: Image.Image, prompt: str) -> Dict[str, Any]:
     image_features = DeepseekOCRProcessor().tokenize_with_images(
@@ -218,25 +181,6 @@ def _generate_for_images(images: List[Image.Image], prompt: str) -> List[Dict[st
         results.append(cleaned)
     return results
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Determine desired settings: prefer app.state (when launched via __main__),
-    # otherwise fall back to environment (useful for import-string workers).
-    model_path = getattr(app.state, "model_path", None) or os.environ.get("DS_MODEL_PATH")
-    max_concurrency_env = os.environ.get("DS_MAX_CONCURRENCY")
-    max_concurrency = getattr(app.state, "max_concurrency", None)
-    if max_concurrency is None and max_concurrency_env is not None:
-        try:
-            max_concurrency = int(max_concurrency_env)
-        except Exception:
-            raise RuntimeError("Invalid DS_MAX_CONCURRENCY; must be int")
-
-    # Initialize or validate LLM here; fail startup on error
-    _ensure_llm(model_path=model_path, max_concurrency=max_concurrency)
-    yield
-
-
 # -----------------------------
 # FastAPI app
 # -----------------------------
@@ -244,7 +188,6 @@ app = FastAPI(
     title="DeepSeek-OCR API",
     description="Blazing fast OCR with DeepSeek-OCR model 🔥",
     version="2.0.0",
-    lifespan=lifespan
 )
 
 # CORS middleware for React frontend
@@ -264,7 +207,7 @@ def health() -> Dict[str, str]:
 @app.post("/v1/ocr")
 async def ocr(
     file: UploadFile = File(...),
-    prompt: str = Form(PROMPT),
+    prompt: str = Form(DEFAULT_PROMPT),
     file_type: Optional[str] = Form(None),
     dpi: int = Form(144),
 ) -> JSONResponse:
@@ -318,42 +261,27 @@ async def ocr(
 
 
 if __name__ == "__main__":
-    import argparse
-    import uvicorn
 
     parser = argparse.ArgumentParser(description="DeepSeek OCR REST API")
-    parser.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
-    parser.add_argument("--model-path", required=False, default=os.environ.get("DS_MODEL_PATH"))
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--model-name", required=False, default=DEFAULT_MODEL_NAME)
+    parser.add_argument("--model-path", required=False, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--max-concurrency", type=int, required=False,
-                        default=int(os.environ.get("DS_MAX_CONCURRENCY", 32)))
-    parser.add_argument("--workers", type=int, required=False,
-                        default=1,
-                        help="Number of uvicorn worker processes (do not over-subscribe GPU)")
-    args = parser.parse_args()
+                        default=32)
+    parser.add_argument("--tensor-parallel-size", type=int, required=False,
+                        default=1)
 
-    # Propagate CLI config to env so worker processes (if any) can read them
-    if args.model_path:
-        os.environ["DS_MODEL_PATH"] = args.model_path
-    os.environ["DS_MAX_CONCURRENCY"] = str(args.max_concurrency)
+    args = parser.parse_args()
 
     # Initialize LLM per CLI args in this process (used when workers == 1)
     try:
-        _ensure_llm(model_path=args.model_path, max_concurrency=args.max_concurrency)
+        llm = _init_llm(args.model_name,
+                        args.model_path,
+                        args.max_concurrency,
+                        args.tensor_parallel_size)
     except Exception as e:
         raise SystemExit(f"Failed to initialize model: {e}")
 
-    # Also store on app.state for the same-process server path
-    app.state.model_path = args.model_path
-    app.state.max_concurrency = args.max_concurrency
-
-    if args.workers < 1:
-        raise SystemExit("--workers must be >= 1")
-
-    if args.workers == 1:
-        # Run with in-process app instance to preserve initialized model
-        uvicorn.run(app, host=args.host, port=args.port, reload=False)
-    else:
-        # Multiple workers require import string
-        uvicorn.run("api_server:app", host=args.host, port=args.port, reload=False, workers=args.workers)
-
+    # Run with in-process app instance to preserve initialized model
+    uvicorn.run(app, host=args.host, port=args.port, reload=False)
