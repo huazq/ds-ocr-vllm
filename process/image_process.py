@@ -1,12 +1,14 @@
+import os
 import math
 from typing import List, Tuple
 
 import torch
 import torchvision.transforms as T
 from PIL import Image, ImageOps
-from transformers import AutoProcessor, BatchFeature, LlamaTokenizerFast
+from transformers import AutoProcessor, BatchFeature, LlamaTokenizer, LlamaTokenizerFast
+from transformers import AutoTokenizer
 from transformers.processing_utils import ProcessorMixin
-from config import IMAGE_SIZE, BASE_SIZE, CROP_MODE, MIN_CROPS, MAX_CROPS, PROMPT, TOKENIZER
+from config import IMAGE_SIZE, BASE_SIZE, CROP_MODE, MIN_CROPS, MAX_CROPS, PROMPT
 
 def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
     best_ratio_diff = float('inf')
@@ -114,7 +116,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
 
     def __init__(
         self,
-        tokenizer: LlamaTokenizerFast = TOKENIZER,
+        tokenizer: LlamaTokenizerFast,
         candidate_resolutions: Tuple[Tuple[int, int]] = [[1024, 1024]],
         patch_size: int = 16,
         downsample_ratio: int = 4,

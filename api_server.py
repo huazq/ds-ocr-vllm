@@ -10,7 +10,7 @@ import uvicorn
 import fitz  # PyMuPDF
 from PIL import Image, ImageOps
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,7 +23,7 @@ from process.image_process import DeepseekOCRProcessor
 from process.ngram_norepeat import NoRepeatNGramLogitsProcessor
 
 PROMPT_PERFIX='<image>\n<|grounding|>'
-DEFAULT_PROMPT = 'Convert the document to markdown.'
+DEFAULT_PROMPT = 'Convert the document to markdown.' 
 CROP_MODE = True
 DEFAULT_MODEL_PATH="/mnt/models"
 DEFAULT_MODEL_NAME="DeepSeek-OCR"
@@ -31,17 +31,15 @@ DEFAULT_MODEL_NAME="DeepSeek-OCR"
 # Register custom model class with vLLM
 ModelRegistry.register_model("DeepseekOCRForCausalLM", DeepseekOCRForCausalLM)
 
-
+# Global singleton LLM and its current settings
+llm: Optional[LLM] = None
 def _init_llm(model_name: str,
               model_path: str,
               max_concurrency: int,
               tensor_parallel_size: int) -> LLM:
-    # model_path is parent dir of model,
-    # we need pass model_path+model_name to vllm
-    model = model_path + "/" + model_name
     llm_local = LLM(
         served_model_name=model_name,
-        model=model,
+        model=model_path,
         hf_overrides={"architectures": ["DeepseekOCRForCausalLM"]},
         block_size=64,
         enforce_eager=False,
@@ -53,11 +51,10 @@ def _init_llm(model_name: str,
         gpu_memory_utilization=0.9,
         disable_mm_preprocessor_cache=True,
     )
+
     return llm_local
 
 
-# Global singleton LLM and its current settings
-llm: Optional[LLM] = None
 sampling_params = SamplingParams(
     temperature=0.0,
     max_tokens=8192,
@@ -157,7 +154,7 @@ def _clean_text_and_collect_regions(
     return {"text": cleaned}
 
 def _build_mm_request(image: Image.Image, prompt: str) -> Dict[str, Any]:
-    image_features = DeepseekOCRProcessor().tokenize_with_images(
+    image_features = DeepseekOCRProcessor(llm.get_tokenizer()).tokenize_with_images(
         images=[image], bos=True, eos=True, cropping=CROP_MODE
     )
     return {
@@ -169,7 +166,7 @@ def _generate_for_images(images: List[Image.Image], prompt: str) -> List[Dict[st
     if not images:
         return []
     # add prompt prefix
-    prompt = PROMPT_PERFIX + prompt
+    prompt = PROMPT_PERFIX + prompt 
     batch_inputs = [
         _build_mm_request(img, prompt) for img in images
     ]
@@ -206,25 +203,29 @@ def health() -> Dict[str, str]:
 
 @app.post("/v1/ocr")
 async def ocr(
-    file: UploadFile = File(...),
-    prompt: str = Form(DEFAULT_PROMPT),
-    file_type: Optional[str] = Form(None),
-    dpi: int = Form(144),
+    request: Request,
+    prompt: str = Query(DEFAULT_PROMPT),
+    file_type: Optional[str] = Query(None),
+    dpi: int = Query(144),
 ) -> JSONResponse:
     """
     Perform OCR on an uploaded PDF or image.
 
     - file: uploaded file (PDF or image)
-    - prompt: optional prompt (defaults to config.PROMPT)
+    - prompt: optional prompt (defaults to DEFAULT_PROMPT)
     - file_type: optional hint: "pdf" or "image"; auto-detects by content type/extension
     - dpi: PDF rasterization DPI (default 144)
     """
     if llm is None:
         raise HTTPException(status_code=503, detail="Model not initialized. Start server with --model-path.")
 
-    data = await file.read()
-    content_type = file.content_type or ""
-    name = file.filename or ""
+    #data = await file.read()
+    # Read raw bytes from request body
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty request body.")
+
+    content_type = request.headers.get("content-type", "")
 
     # Determine type
     t = (file_type or "").lower()
@@ -234,13 +235,14 @@ async def ocr(
     elif t == "image":
         is_pdf = False
     else:
-        if content_type == "application/pdf" or name.lower().endswith(".pdf"):
+        if content_type == "application/pdf":
             is_pdf = True
         else:
             is_pdf = False
 
     try:
         if is_pdf:
+            print("file type is pdf")
             images = _pdf_bytes_to_images_high_quality(data, dpi=dpi)
             results = _generate_for_images(images, prompt)
             # Keep consistent page indexing starting at 0 in regions; also include count
@@ -274,6 +276,9 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # DeepseekOCRProcessor need DS_MODEL_PATH to init tokenizer
+    os.environ['DS_MODEL_PATH'] = args.model_path
+
     # Initialize LLM per CLI args in this process (used when workers == 1)
     try:
         llm = _init_llm(args.model_name,
@@ -285,3 +290,4 @@ if __name__ == "__main__":
 
     # Run with in-process app instance to preserve initialized model
     uvicorn.run(app, host=args.host, port=args.port, reload=False)
+

@@ -1,5 +1,6 @@
 
 """Inference-only Deepseek-OCR model compatible with HuggingFace weights."""
+import os
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from typing import List, Literal, Optional, Set, Tuple, TypedDict, Union
@@ -9,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from transformers import BatchFeature
+from transformers import AutoTokenizer
 
 from vllm.config import VllmConfig
 from vllm.model_executor import SamplingMetadata
@@ -133,9 +135,11 @@ class DeepseekOCRDummyInputsBuilder(
         max_image_size = self.info.get_image_size_with_most_features()
 
         if '<image>' in PROMPT:
+            model = os.environ.get('DS_MODEL_PATH', "/mnt/models/DeepSeekOCR")
+            tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True, local_files_only=True)
             return {
                 "image":
-                DeepseekOCRProcessor().tokenize_with_images(images = self._get_dummy_images(width=max_image_size.width,
+                DeepseekOCRProcessor(tokenizer=tokenizer).tokenize_with_images(images = self._get_dummy_images(width=max_image_size.width,
                                     height=max_image_size.height,
                                     num_images=num_images), bos=True, eos=True, cropping=CROP_MODE)
             }
